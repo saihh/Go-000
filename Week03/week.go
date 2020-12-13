@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,46 +12,74 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var shutdownChan = make(chan error)
+
 func main() {
 	ctx := context.Background()
+
 	g, gctx := errgroup.WithContext(ctx)
 
-	svr := &http.Server{
-		Addr: ":8080",
-	}
 	g.Go(func() error {
-		return StartServer(svr)
+		return ServeApp(gctx.Done())
 	})
 
 	g.Go(func() error {
-		return NotifySignal(gctx, svr)
+		return NotifySignal(gctx.Done())
 	})
 	if err := g.Wait(); err != nil {
-		log.Fatal(err)
+		fmt.Printf("errgroup err %s\n", err)
+	}
+	if err := <-shutdownChan; err != nil {
+		fmt.Printf("shutdown err %s\n", err)
 	}
 }
 
-// StartServer 服务启动
-func StartServer(svr *http.Server) error {
-	if err := svr.ListenAndServe(); err != http.ErrServerClosed {
-		return err
+// HelloHandler 返回hello
+type HelloHandler struct{}
+
+func (h *HelloHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintln(w, "hello")
+}
+
+// ServeApp 服务启动
+func ServeApp(stop <-chan struct{}) error {
+	addr := "0.0.0.0:8080"
+	handler := &HelloHandler{}
+	return serve(addr, handler, stop)
+}
+
+func serve(addr string, handler http.Handler, stop <-chan struct{}) error {
+	svr := &http.Server{
+		Addr:    addr,
+		Handler: handler,
 	}
-	fmt.Println("svr ErrServerClosed")
-	return nil
+
+	go func() {
+		<-stop
+		fmt.Println("serve rcv stop and svr is about to shutdown")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		shutdownChan <- svr.Shutdown(shutCtx)
+		fmt.Println("svr truely shutdown")
+	}()
+	return svr.ListenAndServe()
 }
 
 // NotifySignal 监听信号
-func NotifySignal(gctx context.Context, svr *http.Server) error {
+func NotifySignal(stop <-chan struct{}) error {
 	sigint := make(chan os.Signal, 1)
 	signal.Notify(sigint, os.Interrupt)
+	defer func() {
+		signal.Stop(sigint)
+		close(sigint)
+	}()
+
 	select {
-	case <-gctx.Done():
-		fmt.Println("gctx cancel")
+	case <-stop:
+		fmt.Println("NotifySignal rcv stop")
 	case <-sigint:
-		fmt.Println("sigint shutdown")
-		shutCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		svr.Shutdown(shutCtx)
+		fmt.Println("sigint notified")
+		return errors.New("sigint notified")
 	}
 	return nil
 }
